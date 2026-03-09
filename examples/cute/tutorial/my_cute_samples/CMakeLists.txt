@@ -1,5 +1,5 @@
 
-# Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 #
 # Redistribution and use in source and binary forms, with or without
@@ -27,36 +27,52 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-add_subdirectory(hopper)
-add_subdirectory(blackwell)
-add_subdirectory(my_cute_samples)
-
 cutlass_example_add_executable(
-  cute_tutorial_sgemm_1
-  sgemm_1.cu
+  00_cute_mma_atom
+  00_cute_mma_atom.cu
 )
 
 cutlass_example_add_executable(
-  cute_tutorial_sgemm_2
-  sgemm_2.cu
+  01_cute_copy_atom
+  01_cute_copy_atom.cu
 )
 
 cutlass_example_add_executable(
-  cute_tutorial_sgemm_sm70
-  sgemm_sm70.cu
+  02_cute_print_layout
+  02_cute_print_layout.cu
 )
 
 cutlass_example_add_executable(
-  cute_tutorial_sgemm_sm80
-  sgemm_sm80.cu
+  03_cute_mma_atom_fp8
+  03_cute_mma_atom_fp8.cu
 )
 
 cutlass_example_add_executable(
-  cute_tutorial_tiled_copy
-  tiled_copy.cu
+  04_cute_copy_atom_fp8
+  04_cute_copy_atom_fp8.cu
 )
 
 cutlass_example_add_executable(
-  cute_tutorial_tiled_copy_if
-  tiled_copy_if.cu
+  05_cute_mma_tile
+  05_cute_mma_tile.cu
+)
+
+cutlass_example_add_executable(
+  06_cute_copy_tile
+  06_cute_copy_tile.cu
+)
+
+cutlass_example_add_executable(
+  07_cute_mma_copy_block
+  07_cute_mma_copy_block.cu
+)
+
+cutlass_example_add_executable(
+  08_cute_swizzleing
+  08_cute_swizzleing.cu
+)
+
+cutlass_example_add_executable(
+  09_cute_gemm_sm80_divied
+  09_cute_gemm_sm80_divied.cu
 )
