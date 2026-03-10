@@ -202,7 +202,7 @@ __global__ void gemm_kernel(TC *Cptr, TA *Aptr, TB *Bptr, int m, int n, int k){
 int main(int argc, char** argv){
 
 
-        // 2. 获取第0个设备的属性
+    // 2. 获取第0个设备的属性
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, 0);
 
@@ -217,9 +217,14 @@ int main(int argc, char** argv){
               << deviceProp.sharedMemPerBlock / 1024.0 << " KB)" << std::endl;
     
     // 每个SM的最大共享内存大小（字节）
-    std::cout << "每个SM的最大共享内存配置大小: " 
-              << deviceProp.sharedMemPerMultiprocessor << " 字节 (" 
+    std::cout << "每个SM的最大共享内存配置大小: "
+              << deviceProp.sharedMemPerMultiprocessor << " 字节 ("
               << deviceProp.sharedMemPerMultiprocessor / 1024.0 << " KB)" << std::endl;
+
+    // 通过 cudaFuncAttributeMaxDynamicSharedMemorySize 可申请到的最大动态共享内存
+    std::cout << "每个Block可申请的最大动态共享内存(sharedMemPerBlockOptin): "
+              << deviceProp.sharedMemPerBlockOptin << " 字节 ("
+              << deviceProp.sharedMemPerBlockOptin / 1024.0 << " KB)" << std::endl;
 
     int m = 128;
     if (argc >= 2)
@@ -315,11 +320,21 @@ int main(int argc, char** argv){
        grid.x, grid.y, grid.z,
        block.x, block.y, block.z);
 
-    cudaFuncSetAttribute(gemm_kernel<TC, TA, TB, 128, 128, 64, 
+    // 申请量超过设备上限时直接退出，避免后续 kernel launch 崩溃
+    if (kShmSize > deviceProp.sharedMemPerBlockOptin) {
+        fprintf(stderr,
+                "Error: 申请的动态共享内存 %d 字节 (%.1f KB) 超过设备上限 %zu 字节 (%.1f KB)，程序退出。\n",
+                kShmSize,      kShmSize / 1024.0,
+                deviceProp.sharedMemPerBlockOptin,
+                deviceProp.sharedMemPerBlockOptin / 1024.0);
+        return 1;
+    }
+
+    cudaFuncSetAttribute(gemm_kernel<TC, TA, TB, 128, 128, 64,
                                     SmemLayoutA, SmemLayoutB,
-                                    TiledMMA, 
-                                    TiledCopyA_G2S, TiledCopyB_G2S, 
-                                    TiledCopyA_S2R, TiledCopyB_S2R, 
+                                    TiledMMA,
+                                    TiledCopyA_G2S, TiledCopyB_G2S,
+                                    TiledCopyA_S2R, TiledCopyB_S2R,
                                     TiledCopyC_R2G>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     kShmSize);
