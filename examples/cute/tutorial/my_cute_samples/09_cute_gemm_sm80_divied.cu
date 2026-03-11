@@ -8,12 +8,16 @@
 #include <iostream>
 #include <vector>
 
+#include <cuda_runtime.h>
+#include <chrono>
+
 using namespace cute;
 
 // Kernel: each block computes one (kTileM x kTileN) output tile.
 // Loops over K-tiles and accumulates into register fragment tCrC.
 template <typename TC, typename TA, typename TB,
           int kTileM, int kTileN, int kTileK,
+          typename SmemLayoutA, typename SmemLayoutB,
           typename TiledMMA,
           typename TiledCopyA_G2S, typename TiledCopyB_G2S,
           typename TiledCopyA_S2R, typename TiledCopyB_S2R,
@@ -34,90 +38,103 @@ __global__ void gemm_kernel(TC *Cptr, TA *Aptr, TB *Bptr, int m, int n, int k) {
     Tensor mB = make_tensor(make_gmem_ptr(Bptr), make_shape(n, k), make_stride(k, Int<1>{}));
     Tensor mC = make_tensor(make_gmem_ptr(Cptr), make_shape(m, n), make_stride(n, Int<1>{}));
 
-    // Swizzled shared memory layouts (same as swizzle_copy.cu)
-    using SmemLayoutAtomA = decltype(
-        composition(Swizzle<3, 3, 3>{},
-                    Layout<Shape<_128, _64>, Stride<_64, _1>>{}));
-    using SmemLayoutAtomB = decltype(
-        composition(Swizzle<3, 3, 3>{},
-                    Layout<Shape<_128, _64>, Stride<_64, _1>>{}));
-
-    Tensor sA = make_tensor(make_smem_ptr(smem_A), SmemLayoutAtomA{});
-    Tensor sB = make_tensor(make_smem_ptr(smem_B), SmemLayoutAtomB{});
+    Tensor sA = make_tensor(make_smem_ptr(smem_A), SmemLayoutA{});
+    Tensor sB = make_tensor(make_smem_ptr(smem_B), SmemLayoutB{});
 
     auto tiler = make_tile(Int<kTileM>{}, Int<kTileN>{}, Int<kTileK>{});
 
-    // Output tile: fixed for the lifetime of this block
-    Tensor gC = local_tile(mC, tiler, make_coord(tile_m, tile_n, 0), Step<_1, _1, X>{});
+    // one block task
+    Tensor gA = local_tile(mA, tiler, make_coord(tile_m, tile_n, _), Step<_1,  X, _1>{}); //(kTileM, kTileK, num_tile_k)
+    Tensor gB = local_tile(mB, tiler, make_coord(tile_m, tile_n, _), Step< X, _1, _1>{}); //(kTileN, kTileK, num_tile_k)
+    Tensor gC = local_tile(mC, tiler, make_coord(tile_m, tile_n, _), Step<_1, _1,  X>{}); //(kTileM, kTileN)
+    if(thread0()){
+        print("\n");
+        print("gA: ");print(gA);print("\n");
+        print("gB: ");print(gB);print("\n");
+        print("gC: ");print(gC);print("\n");
+    }
 
+    // 创建TiledCopyA_G2S的对象，每一次从gA拷贝一个(kTileM, kTileK)大小的块到sA
+    TiledCopyA_G2S g2s_tiled_copy_a;
+    ThrCopy g2s_thr_copy_a  = g2s_tiled_copy_a.get_slice(tid);
+    Tensor  tAgA_g2s        = g2s_thr_copy_a.partition_S(gA);
+    Tensor  tAsA_g2s        = g2s_thr_copy_a.partition_D(sA);
+    // 创建TiledCopyB_G2S的对象，每一次从gB拷贝一个(kTileN, kTileK)大小的块到sB
+    TiledCopyB_G2S g2s_tiled_copy_b;
+    ThrCopy g2s_thr_copy_b  = g2s_tiled_copy_b.get_slice(tid);
+    Tensor  tBgB_g2s        = g2s_thr_copy_b.partition_S(gB);
+    Tensor  tBsB_g2s        = g2s_thr_copy_b.partition_D(sB);
+    if(thread0()){
+        print("\n");
+        print("tAgA_g2s: ");print(tAgA_g2s);print("\n");
+        print("tAsA_g2s: ");print(tAsA_g2s);print("\n");
+        print("tBgB_g2s: ");print(tBgB_g2s);print("\n");
+        print("tBsB_g2s: ");print(tBsB_g2s);print("\n");
+    }
+
+    // TiledMMA compute  (kTileM, kTileN, kTileK)
     TiledMMA tiled_mma;
     ThrMMA   thr_mma = tiled_mma.get_slice(tid);
+    // 创建每个线程上的寄存器中的tensor
+    Tensor tArA = thr_mma.partition_fragment_A(gA(_, _, 0));        // reg  (MMA, MMA_M, MMA_K)
+    Tensor tBrB = thr_mma.partition_fragment_B(gB(_, _, 0));        // reg  (MMA, MMA_M, MMA_K)
+    Tensor tCrC = thr_mma.partition_fragment_C(gC);                 // reg  (MMA, MMA_M, MMA_N)
+    if(thread0()){
+        print("\n");
+        print("tArA: ");print(tArA);print("\n");
+        print("tBrB: ");print(tBrB);print("\n");
+        print("tCrC: ");print(tCrC);print("\n");
+    }
+    // 创建TiledCopyA_S2R的对象,每一次按照tArA的layout，从sA拷贝一个(kTileM, kTileK)大小的块到tArA
+    TiledCopyA_S2R  s2r_tiled_copy_a;
+    ThrCopy         s2r_thr_copy_a = s2r_tiled_copy_a.get_slice(tid);
+    Tensor          tAsA_s2r = s2r_thr_copy_a.partition_S(sA);
+    Tensor          tArA_s2r = s2r_thr_copy_a.retile_D(tArA);
+    if(thread0()){
+        print("\n");
+        print("tAsA_s2r: ");print(tAsA_s2r);print("\n");
+        print("tArA_s2r: ");print(tArA_s2r);print("\n");
+    }
+    // 创建TiledCopyB_S2R的对象,每一次按照tBrB的layout，从sB拷贝一个(kTileN, kTileK)大小的块到tBrB
+    TiledCopyB_S2R  s2r_tiled_copy_b;
+    ThrCopy         s2r_thr_copy_b = s2r_tiled_copy_b.get_slice(tid);
+    Tensor          tBsB_s2r = s2r_thr_copy_b.partition_S(sB);
+    Tensor          tBrB_s2r = s2r_thr_copy_b.retile_D(tBrB);
+    if(thread0()){
+        print("\n");
+        print("tBsB_s2r: ");print(tBsB_s2r);print("\n");
+        print("tBrB_s2r: ");print(tBrB_s2r);print("\n");
+    }
+    // 创建 TiledCopyC_R2G 的对象，把每个线程上的tCrC拷贝到全局内存gC上
+    TiledCopyC_R2G r2g_tiled_copy_c;
+    ThrCopy r2g_thr_copy_c = r2g_tiled_copy_c.get_slice(tid);
+    Tensor  tCrC_r2g = r2g_thr_copy_c.retile_S(tCrC);    // (CPY, CPY_M, CPY_N)
+    Tensor  tCgC_r2g = r2g_thr_copy_c.partition_D(gC);   // (CPY, CPY_M, CPY_N)
 
-    Tensor tCgC = thr_mma.partition_C(gC);            // (MMA, MMA_M, MMA_N)
-    Tensor tCrC = thr_mma.partition_fragment_C(gC);   // (MMA, MMA_M, MMA_N)
-    clear(tCrC);  // zero-initialize accumulator
-
-    // Copy objects (constructed once, reused across K-loop)
-    TiledCopyA_G2S g2s_tiled_copy_a;
-    TiledCopyB_G2S g2s_tiled_copy_b;
-    TiledCopyA_S2R s2r_tiled_copy_a;
-    TiledCopyB_S2R s2r_tiled_copy_b;
-
-    ThrCopy g2s_thr_copy_a = g2s_tiled_copy_a.get_slice(tid);
-    ThrCopy g2s_thr_copy_b = g2s_tiled_copy_b.get_slice(tid);
-    ThrCopy s2r_thr_copy_a = s2r_tiled_copy_a.get_slice(tid);
-    ThrCopy s2r_thr_copy_b = s2r_tiled_copy_b.get_slice(tid);
-
+     if(thread0()){
+        print("\n");
+        print("tCrC_r2g: ");print(tCrC_r2g);print("\n");
+        print("tCgC_r2g: ");print(tCgC_r2g);print("\n");
+    }
     // -------------------------------------------------------------------------
     // Main K-loop: iterate over K-tiles and accumulate
     // -------------------------------------------------------------------------
     int num_k_tiles = k / kTileK;
 
     for (int k_tile = 0; k_tile < num_k_tiles; ++k_tile) {
-        auto coord = make_coord(tile_m, tile_n, k_tile);
-
-        // Global tiles for this K-slice
-        Tensor gA = local_tile(mA, tiler, coord, Step<_1, X, _1>{});  // (kTileM, kTileK)
-        Tensor gB = local_tile(mB, tiler, coord, Step<X, _1, _1>{});  // (kTileN, kTileK)
-
-        // ----- Global → Shared (async) -----
-        Tensor tAgA_g2s = g2s_thr_copy_a.partition_S(gA);
-        Tensor tAsA_g2s = g2s_thr_copy_a.partition_D(sA);
-        Tensor tBgB_g2s = g2s_thr_copy_b.partition_S(gB);
-        Tensor tBsB_g2s = g2s_thr_copy_b.partition_D(sB);
-
-        copy(g2s_tiled_copy_a, tAgA_g2s, tAsA_g2s);
-        copy(g2s_tiled_copy_b, tBgB_g2s, tBsB_g2s);
-
+        copy(g2s_tiled_copy_a, tAgA_g2s(_, _, _, k_tile), tAsA_g2s);
+        copy(g2s_tiled_copy_b, tBgB_g2s(_, _, _, k_tile), tBsB_g2s);
         cp_async_fence();
         cp_async_wait<0>();
         __syncthreads();   // all threads see completed smem writes
 
-        // ----- Shared → Register -----
-        Tensor tCrA = thr_mma.partition_fragment_A(gA);  // (MMA, MMA_M, MMA_K)
-        Tensor tCrB = thr_mma.partition_fragment_B(gB);  // (MMA, MMA_N, MMA_K)
+        copy(s2r_tiled_copy_a, tAsA_s2r, tArA_s2r);
+        copy(s2r_tiled_copy_b, tBsB_s2r, tBrB_s2r);
 
-        Tensor tAgA_s2r = s2r_thr_copy_a.partition_S(sA);
-        Tensor tArA_s2r = s2r_thr_copy_a.retile_D(tCrA);
-        Tensor tBgB_s2r = s2r_thr_copy_b.partition_S(sB);
-        Tensor tBrB_s2r = s2r_thr_copy_b.retile_D(tCrB);
-
-        copy(s2r_tiled_copy_a, tAgA_s2r, tArA_s2r);
-        copy(s2r_tiled_copy_b, tBgB_s2r, tBrB_s2r);
-
-        // ----- MMA accumulate -----
-        gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC);
+        gemm(tiled_mma, tCrC, tArA, tBrB, tCrC);
 
         __syncthreads();   // ensure all threads done reading smem before next write
     }
-
-    // -------------------------------------------------------------------------
-    // Write accumulator back to global memory
-    // -------------------------------------------------------------------------
-    TiledCopyC_R2G r2g_tiled_copy_c;
-    ThrCopy r2g_thr_copy_c = r2g_tiled_copy_c.get_slice(tid);
-    Tensor tCrC_r2g = r2g_thr_copy_c.retile_S(tCrC);   // (CPY, CPY_M, CPY_N)
-    Tensor tCgC_r2g = r2g_thr_copy_c.retile_D(tCgC);   // (CPY, CPY_M, CPY_N)
     copy(r2g_tiled_copy_c, tCrC_r2g, tCgC_r2g);
 }
 
@@ -201,6 +218,17 @@ int main(int argc, char** argv) {
                         Layout<Shape<_32, _8>, Stride<_8, _1>>{},
                         Layout<Shape<_1, _8>>{}));
 
+    using SmemLayoutAtomA = decltype(
+        composition(Swizzle<3, 3, 3>{},
+                    Layout<Shape<_8, _64>,
+                           Stride<_64, _1>>{}));
+    using SmemLayoutAtomB = decltype(
+        composition(Swizzle<3, 3, 3>{},
+                    Layout<Shape<_8, _64>, 
+                           Stride<_64, _1>>{}));
+    using SmemLayoutA = decltype(tile_to_shape(SmemLayoutAtomA{}, make_shape(Int<128>{}, Int<64>{})));
+    using SmemLayoutB = decltype(tile_to_shape(SmemLayoutAtomB{}, make_shape(Int<128>{}, Int<64>{})));
+
     using CopyA_atom = Copy_Atom<SM75_U32x4_LDSM_N, TA>;
     using CopyB_atom = Copy_Atom<SM75_U32x4_LDSM_N, TB>;
     using CopyC_atom = Copy_Atom<AutoVectorizingCopy, TC>;
@@ -220,12 +248,14 @@ int main(int argc, char** argv) {
     printf("grid: (%d, %d, %d)\n\n", grid.x, grid.y, grid.z);
 
     using KernelT = decltype(&gemm_kernel<TC, TA, TB, kTileM, kTileN, kTileK,
+                                          SmemLayoutA, SmemLayoutB,
                                           TiledMMA,
                                           TiledCopyA_G2S, TiledCopyB_G2S,
                                           TiledCopyA_S2R, TiledCopyB_S2R,
                                           TiledCopyC_R2G>);
 
     KernelT kernel_ptr = gemm_kernel<TC, TA, TB, kTileM, kTileN, kTileK,
+                                     SmemLayoutA, SmemLayoutB,    
                                      TiledMMA,
                                      TiledCopyA_G2S, TiledCopyB_G2S,
                                      TiledCopyA_S2R, TiledCopyB_S2R,
@@ -236,8 +266,33 @@ int main(int argc, char** argv) {
                          kShmSize);
     CUTE_CHECK_LAST();
 
+    // ========================================
+    // GPU核函数时间统计 - 开始
+    // ========================================
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    float gpu_elapsed_time_ms;
+
+    // 记录开始时间
+    cudaEventRecord(start, 0);
+
+    // 启动核函数
     kernel_ptr<<<grid, block, kShmSize>>>(
         d_C.data().get(), d_A.data().get(), d_B.data().get(), m, n, k);
+    
+    // 记录结束时间
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&gpu_elapsed_time_ms, start, stop);
+    
+    // 释放事件资源
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    // ========================================
+    // GPU核函数时间统计 - 结束
+    // ========================================
+
     CUTE_CHECK_LAST();
     cudaDeviceSynchronize();
     
@@ -253,7 +308,20 @@ int main(int argc, char** argv) {
     for (int i = 0; i < n * k; ++i) B_fp32[i] = static_cast<float>(h_B[i]);
 
     std::vector<float> C_ref(m * n, 0.f);
+
+    // ========================================
+    // CPU参考实现时间统计 - 开始
+    // ========================================
+    auto cpu_start = std::chrono::high_resolution_clock::now();
+    
+    // 执行CPU参考实现
     cpu_gemm_ref(A_fp32, B_fp32, C_ref, m, n, k);
+    
+    auto cpu_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> cpu_elapsed_time_ms = cpu_end - cpu_start;
+    // ========================================
+    // CPU参考实现时间统计 - 结束
+    // ========================================
     
     printf("cpu calc finished\n");
     printf("compare gpu&cpu result m: %d, n: %d\n", m, n);
@@ -271,6 +339,26 @@ int main(int argc, char** argv) {
         printf("PASS\n");
     else
         printf("FAIL\n");
+
+    // ========================================
+    // 输出时间统计结果
+    // ========================================
+    printf("\n========================================");
+    printf("\nPerformance Statistics:");
+    printf("\n----------------------------------------");
+    printf("\nGPU Kernel Time:   %.3f ms", gpu_elapsed_time_ms);
+    printf("\nCPU Reference Time: %.3f ms", cpu_elapsed_time_ms.count());
+    printf("\nSpeedup (CPU/GPU):  %.2f x", cpu_elapsed_time_ms.count() / gpu_elapsed_time_ms);
+    
+    // 计算GEMM的FLOPs（浮点运算数）：2*m*n*k（每个元素需要k次乘法+ k-1次加法，近似2*m*n*k）
+    double flops = 2.0 * m * n * k;
+    double gpu_flops = flops / (gpu_elapsed_time_ms * 1e-3) / 1e12; // TFLOPS
+    double cpu_flops = flops / (cpu_elapsed_time_ms.count() * 1e-3) / 1e9; // GFLOPS
+    printf("\n----------------------------------------");
+    printf("\nTotal FLOPs:        %.2f GFLOPs", flops / 1e9);
+    printf("\nGPU Performance:    %.3f TFLOPS", gpu_flops);
+    printf("\nCPU Performance:    %.3f GFLOPS", cpu_flops);
+    printf("\n========================================\n");
 
     return 0;
 }
